@@ -18,6 +18,7 @@ type Tokenizer struct {
 	Vocab            map[string]int
 	Inverse          map[int]string
 	Merges           [][2]string // BPE merge rules in priority order
+	AddedTokens      []string    // special token strings (sorted longest first for greedy match)
 	BOS              int         // beginning of sequence token ID
 	EOS              int         // end of sequence token ID
 	byteLevelPretok  bool        // use GPT-style word splitting before BPE
@@ -89,6 +90,7 @@ func loadTokenizerJSON(path string) (*Tokenizer, error) {
 	for _, at := range tj.AddedTokens {
 		t.Vocab[at.Content] = at.ID
 		t.Inverse[at.ID] = at.Content
+		t.AddedTokens = append(t.AddedTokens, at.Content)
 		if at.Content == "<s>" || at.Content == "<bos>" {
 			t.BOS = at.ID
 		}
@@ -96,6 +98,9 @@ func loadTokenizerJSON(path string) (*Tokenizer, error) {
 			t.EOS = at.ID
 		}
 	}
+	sort.Slice(t.AddedTokens, func(i, j int) bool {
+		return len(t.AddedTokens[i]) > len(t.AddedTokens[j])
+	})
 
 	// Detect if this is a byte-level BPE tokenizer with pretokenization.
 	// Instead of parsing the regex (Go's regexp lacks lookaheads), we use
@@ -291,15 +296,67 @@ func (t *Tokenizer) Encode(text string) []int {
 		tokens = append(tokens, t.BOS)
 	}
 
-	if len(t.Merges) > 0 {
-		// Full BPE with merge rules
-		tokens = append(tokens, t.encodeBPE(text)...)
-	} else {
-		// Greedy longest-match (for sentencepiece without merge rules)
-		tokens = append(tokens, t.encodeGreedy(text)...)
+	// Split text on special/added tokens, encode each segment separately
+	segments := t.splitOnSpecialTokens(text)
+	for _, seg := range segments {
+		if id, ok := t.Vocab[seg]; ok && t.isAddedToken(seg) {
+			tokens = append(tokens, id)
+			continue
+		}
+		if len(t.Merges) > 0 {
+			tokens = append(tokens, t.encodeBPE(seg)...)
+		} else {
+			tokens = append(tokens, t.encodeGreedy(seg)...)
+		}
 	}
 
 	return tokens
+}
+
+func (t *Tokenizer) isAddedToken(s string) bool {
+	for _, at := range t.AddedTokens {
+		if at == s { return true }
+	}
+	return false
+}
+
+func (t *Tokenizer) splitOnSpecialTokens(text string) []string {
+	if len(t.AddedTokens) == 0 {
+		return []string{text}
+	}
+
+	var segments []string
+	remaining := text
+	for len(remaining) > 0 {
+		bestIdx := -1
+		bestPos := len(remaining)
+		for i, tok := range t.AddedTokens {
+			pos := indexOf(remaining, tok)
+			if pos >= 0 && pos < bestPos {
+				bestPos = pos
+				bestIdx = i
+			}
+		}
+		if bestIdx < 0 {
+			segments = append(segments, remaining)
+			break
+		}
+		if bestPos > 0 {
+			segments = append(segments, remaining[:bestPos])
+		}
+		segments = append(segments, t.AddedTokens[bestIdx])
+		remaining = remaining[bestPos+len(t.AddedTokens[bestIdx]):]
+	}
+	return segments
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i <= len(s)-len(sub); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
 }
 
 func (t *Tokenizer) encodeBPE(text string) []int {
