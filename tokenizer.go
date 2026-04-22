@@ -567,6 +567,12 @@ func (t *Tokenizer) VocabSize() int {
 	return len(t.Vocab)
 }
 
+// HasToken returns true if the given string exists in the vocabulary.
+func (t *Tokenizer) HasToken(s string) bool {
+	_, ok := t.Vocab[s]
+	return ok
+}
+
 // Keep sort and binary imports used
 var _ = sort.Strings
 var _ = binary.LittleEndian
