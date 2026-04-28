@@ -1,3 +1,3 @@
-module github.com/open-ai-org/tokenizer
+module github.com/tensorwire/tokenizer
 
 go 1.25.0

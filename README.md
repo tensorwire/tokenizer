@@ -1,13 +1,11 @@
 # tokenizer
 
-> **This project has moved to [github.com/tensorwire/tokenizer](https://github.com/tensorwire/tokenizer).** Updates will be published under [github.com/tensorwire](https://github.com/tensorwire). Code remaining in open-ai-org is unmaintained.
-
 BPE tokenizer in pure Go. Loads HuggingFace `tokenizer.json` and SentencePiece `tokenizer.model` formats. Zero dependencies.
 
 ## Install
 
 ```bash
-go get github.com/open-ai-org/tokenizer
+go get github.com/tensorwire/tokenizer
 ```
 
 ## Usage

@@ -31,5 +31,5 @@ size := tok.VocabSize()                  // 50257 for GPT-2
 
 ## Related Packages
 
-- `github.com/open-ai-org/mongoose` — GPU compute engine
-- `github.com/open-ai-org/gguf` — Model serialization
+- `github.com/tensorwire/mongoose` — GPU compute engine
+- `github.com/tensorwire/gguf` — Model serialization
