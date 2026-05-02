@@ -8,8 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"unicode"
 	"strings"
+	"sync"
+	"unicode"
 )
 
 // Tokenizer handles BPE tokenization for LLM inference.
@@ -17,11 +18,12 @@ import (
 type Tokenizer struct {
 	Vocab            map[string]int
 	Inverse          map[int]string
-	Merges           [][2]string // BPE merge rules in priority order
-	AddedTokens      []string    // special token strings (sorted longest first for greedy match)
-	BOS              int         // beginning of sequence token ID
-	EOS              int         // end of sequence token ID
-	byteLevelPretok  bool        // use GPT-style word splitting before BPE
+	Merges           [][2]string    // BPE merge rules in priority order
+	mergePriority    map[string]int // "a b" → rank, built once at load
+	AddedTokens      []string       // special token strings (sorted longest first for greedy match)
+	BOS              int            // beginning of sequence token ID
+	EOS              int            // end of sequence token ID
+	byteLevelPretok  bool           // use GPT-style word splitting before BPE
 }
 
 // LoadTokenizer loads a tokenizer from a model directory.
@@ -151,6 +153,13 @@ func loadTokenizerJSON(path string) (*Tokenizer, error) {
 		}
 	}
 	// If sentencepiece style, Merges stays empty → Encode uses encodeGreedy
+
+	if len(t.Merges) > 0 {
+		t.mergePriority = make(map[string]int, len(t.Merges))
+		for i, m := range t.Merges {
+			t.mergePriority[m[0]+" "+m[1]] = i
+		}
+	}
 
 	return t, nil
 }
@@ -289,137 +298,152 @@ func protoSkip(data []byte, wireType uint64) int {
 	}
 }
 
-// Encode tokenizes text into token IDs using BPE.
+// Encode tokenizes text into token IDs.
+// Short text uses exact BPE merge rules. Long text (>8KB) switches to
+// greedy vocab lookup for speed — the vocab contains all merged tokens.
 func (t *Tokenizer) Encode(text string) []int {
 	var tokens []int
 	if t.BOS >= 0 {
 		tokens = append(tokens, t.BOS)
 	}
 
-	// Split text on special/added tokens, encode each segment separately
-	segments := t.splitOnSpecialTokens(text)
-	for _, seg := range segments {
-		if id, ok := t.Vocab[seg]; ok && t.isAddedToken(seg) {
-			tokens = append(tokens, id)
-			continue
-		}
-		if len(t.Merges) > 0 {
-			tokens = append(tokens, t.encodeBPE(seg)...)
+	if len(t.Merges) > 0 {
+		if len(text) > 8192 {
+			tokens = append(tokens, t.encodeBPEGreedy(text)...)
 		} else {
-			tokens = append(tokens, t.encodeGreedy(seg)...)
+			tokens = append(tokens, t.encodeBPEExact(text)...)
 		}
+	} else {
+		tokens = append(tokens, t.encodeGreedy(text)...)
 	}
-
 	return tokens
 }
 
-func (t *Tokenizer) isAddedToken(s string) bool {
-	for _, at := range t.AddedTokens {
-		if at == s { return true }
+// encodeBPEExact applies merge rules for exact HuggingFace parity.
+func (t *Tokenizer) encodeBPEExact(text string) []int {
+	words := gptPreTokenize(text)
+	var allIDs []int
+	for _, word := range words {
+		allIDs = append(allIDs, t.mergeWord(word)...)
 	}
-	return false
+	return allIDs
 }
 
-func (t *Tokenizer) splitOnSpecialTokens(text string) []string {
-	if len(t.AddedTokens) == 0 {
-		return []string{text}
+// mergeWord runs BPE merge rules on a single pretokenized word.
+func (t *Tokenizer) mergeWord(word string) []int {
+	tokens := make([]string, 0, len(word))
+	for i := 0; i < len(word); i++ {
+		tokens = append(tokens, byteToHFChar(word[i]))
 	}
 
-	var segments []string
-	remaining := text
-	for len(remaining) > 0 {
+	for len(tokens) >= 2 {
 		bestIdx := -1
-		bestPos := len(remaining)
-		for i, tok := range t.AddedTokens {
-			pos := indexOf(remaining, tok)
-			if pos >= 0 && pos < bestPos {
-				bestPos = pos
+		bestPri := len(t.Merges) + 1
+		for i := 0; i < len(tokens)-1; i++ {
+			key := tokens[i] + " " + tokens[i+1]
+			if pri, ok := t.mergePriority[key]; ok && pri < bestPri {
+				bestPri = pri
 				bestIdx = i
 			}
 		}
 		if bestIdx < 0 {
-			segments = append(segments, remaining)
 			break
 		}
-		if bestPos > 0 {
-			segments = append(segments, remaining[:bestPos])
-		}
-		segments = append(segments, t.AddedTokens[bestIdx])
-		remaining = remaining[bestPos+len(t.AddedTokens[bestIdx]):]
-	}
-	return segments
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-func (t *Tokenizer) encodeBPE(text string) []int {
-	// Build merge priority map
-	mergePriority := make(map[string]int, len(t.Merges))
-	for i, m := range t.Merges {
-		mergePriority[m[0]+" "+m[1]] = i
+		merged := tokens[bestIdx] + tokens[bestIdx+1]
+		newTokens := make([]string, 0, len(tokens)-1)
+		newTokens = append(newTokens, tokens[:bestIdx]...)
+		newTokens = append(newTokens, merged)
+		newTokens = append(newTokens, tokens[bestIdx+2:]...)
+		tokens = newTokens
 	}
 
-	// Pretokenize: split text into chunks (words/spaces/punctuation).
-	// BPE merges only happen within each chunk, not across word boundaries.
-	var chunks []string
-	if t.byteLevelPretok {
-		chunks = gptPreTokenize(text)
-	} else {
-		chunks = []string{text}
-	}
-
-	var allIDs []int
-	for _, chunk := range chunks {
-		// Convert chunk to byte-level HF characters
-		tokens := make([]string, 0, len(chunk)*2)
-		for i := 0; i < len(chunk); i++ {
-			tokens = append(tokens, byteToHFChar(chunk[i]))
-		}
-
-		// BPE merge loop
-		for len(tokens) >= 2 {
-			bestIdx := -1
-			bestPri := len(t.Merges) + 1
-			for i := 0; i < len(tokens)-1; i++ {
-				key := tokens[i] + " " + tokens[i+1]
-				if pri, ok := mergePriority[key]; ok && pri < bestPri {
-					bestPri = pri
-					bestIdx = i
+	var ids []int
+	for _, tok := range tokens {
+		if id, ok := t.Vocab[tok]; ok {
+			ids = append(ids, id)
+		} else {
+			for _, b := range []byte(tok) {
+				fallback := fmt.Sprintf("<0x%02X>", b)
+				if id, ok := t.Vocab[fallback]; ok {
+					ids = append(ids, id)
 				}
 			}
-			if bestIdx < 0 {
+		}
+	}
+	return ids
+}
+
+// encodeBPEGreedy uses parallel greedy vocab lookup for large inputs.
+func (t *Tokenizer) encodeBPEGreedy(text string) []int {
+	words := gptPreTokenize(text)
+
+	results := make([][]int, len(words))
+	var wg sync.WaitGroup
+
+	const batchSize = 256
+	for start := 0; start < len(words); start += batchSize {
+		end := start + batchSize
+		if end > len(words) {
+			end = len(words)
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			for i := s; i < e; i++ {
+				results[i] = t.greedyWord(words[i])
+			}
+		}(start, end)
+	}
+	wg.Wait()
+
+	var all []int
+	for _, ids := range results {
+		all = append(all, ids...)
+	}
+	return all
+}
+
+// greedyWord encodes a single word using greedy longest-match on vocab.
+func (t *Tokenizer) greedyWord(word string) []int {
+	hf := make([]byte, 0, len(word)*3)
+	for i := 0; i < len(word); i++ {
+		r := byteToUnicode[word[i]]
+		hf = append(hf, []byte(string(r))...)
+	}
+	runes := []rune(string(hf))
+
+	var ids []int
+	i := 0
+	for i < len(runes) {
+		bestLen := 0
+		bestID := 0
+		maxTry := len(runes) - i
+		if maxTry > 32 {
+			maxTry = 32
+		}
+		for end := maxTry; end >= 1; end-- {
+			sub := string(runes[i : i+end])
+			if id, ok := t.Vocab[sub]; ok {
+				bestLen = end
+				bestID = id
 				break
 			}
-			merged := tokens[bestIdx] + tokens[bestIdx+1]
-			newTokens := make([]string, 0, len(tokens)-1)
-			newTokens = append(newTokens, tokens[:bestIdx]...)
-			newTokens = append(newTokens, merged)
-			newTokens = append(newTokens, tokens[bestIdx+2:]...)
-			tokens = newTokens
 		}
-
-		// Look up token IDs
-		for _, tok := range tokens {
-			if id, ok := t.Vocab[tok]; ok {
-				allIDs = append(allIDs, id)
-			} else {
-				for _, b := range []byte(tok) {
-					fallback := fmt.Sprintf("<0x%02X>", b)
-					if id, ok := t.Vocab[fallback]; ok {
-						allIDs = append(allIDs, id)
-					}
+		if bestLen > 0 {
+			ids = append(ids, bestID)
+			i += bestLen
+		} else {
+			b := []byte(string(runes[i]))
+			for _, bb := range b {
+				fallback := fmt.Sprintf("<0x%02X>", bb)
+				if id, ok := t.Vocab[fallback]; ok {
+					ids = append(ids, id)
 				}
 			}
+			i++
 		}
 	}
-	return allIDs
+	return ids
 }
 
 // gptPreTokenize splits text into chunks following GPT-2/Qwen conventions:
