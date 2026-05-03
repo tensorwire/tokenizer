@@ -643,6 +643,129 @@ func (t *Tokenizer) Decode(ids []int) string {
 	return text
 }
 
+// EncodeFile stream-tokenizes a text file to a binary int32 token file.
+// Reads line-by-line (constant memory), writes tokens as little-endian int32.
+// Returns total token count.
+func (t *Tokenizer) EncodeFile(inPath, outPath string) (int64, error) {
+	fin, err := os.Open(inPath)
+	if err != nil {
+		return 0, err
+	}
+	defer fin.Close()
+
+	fout, err := os.Create(outPath)
+	if err != nil {
+		return 0, err
+	}
+	defer fout.Close()
+
+	bw := make([]byte, 0, 16*1024*1024)
+	buf := make([]byte, 4)
+	var totalTokens int64
+
+	scanner := newLargeScanner(fin)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) == 0 {
+			continue
+		}
+		ids := t.Encode(line)
+		for _, id := range ids {
+			binary.LittleEndian.PutUint32(buf, uint32(int32(id)))
+			bw = append(bw, buf...)
+		}
+		totalTokens += int64(len(ids))
+		if len(bw) >= 16*1024*1024 {
+			if _, err := fout.Write(bw); err != nil {
+				return totalTokens, err
+			}
+			bw = bw[:0]
+		}
+	}
+	if len(bw) > 0 {
+		if _, err := fout.Write(bw); err != nil {
+			return totalTokens, err
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return totalTokens, err
+	}
+	return totalTokens, nil
+}
+
+func newLargeScanner(r *os.File) *largeScanner {
+	return &largeScanner{r: r, buf: make([]byte, 0, 4*1024*1024)}
+}
+
+type largeScanner struct {
+	r    *os.File
+	buf  []byte
+	line string
+	err  error
+	done bool
+	raw  []byte
+	pos  int
+}
+
+func (s *largeScanner) Scan() bool {
+	if s.done {
+		return false
+	}
+	for {
+		// Search for newline in remaining raw buffer
+		for i := s.pos; i < len(s.raw); i++ {
+			if s.raw[i] == '\n' {
+				s.line = string(s.raw[s.pos:i])
+				s.pos = i + 1
+				return true
+			}
+		}
+		// Keep unprocessed tail
+		if s.pos < len(s.raw) {
+			s.buf = append(s.buf[:0], s.raw[s.pos:]...)
+		} else {
+			s.buf = s.buf[:0]
+		}
+		// Read more
+		chunk := make([]byte, 4*1024*1024)
+		n, err := s.r.Read(chunk)
+		if n > 0 {
+			s.raw = append(s.buf, chunk[:n]...)
+			s.pos = 0
+			continue
+		}
+		if len(s.buf) > 0 {
+			s.line = string(s.buf)
+			s.buf = s.buf[:0]
+			s.done = true
+			return true
+		}
+		if err != nil {
+			s.err = err
+		}
+		s.done = true
+		return false
+	}
+}
+
+func (s *largeScanner) Text() string { return s.line }
+func (s *largeScanner) Err() error   { return s.err }
+
+// LoadTokensBin reads a binary int32 token file produced by EncodeFile.
+// Uses mmap for constant startup time regardless of file size.
+func LoadTokensBin(path string) ([]int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	n := len(data) / 4
+	tokens := make([]int, n)
+	for i := 0; i < n; i++ {
+		tokens[i] = int(int32(binary.LittleEndian.Uint32(data[i*4:])))
+	}
+	return tokens, nil
+}
+
 // VocabSize returns the number of tokens in the vocabulary.
 func (t *Tokenizer) VocabSize() int {
 	return len(t.Vocab)
